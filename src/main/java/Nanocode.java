@@ -1,8 +1,10 @@
-///usr/bin/env jbang "$0" "$@" ; exit $?
-//JAVA 25+
-//DEPS com.fasterxml.jackson.core:jackson-databind:2.18.2
-
-import module java.base;
+import java.io.*;
+import java.net.HttpURLConnection;
+import java.net.URI;
+import java.nio.file.*;
+import java.util.*;
+import java.util.concurrent.TimeUnit;
+import java.util.regex.*;
 
 import static java.lang.System.getenv;
 import static java.nio.file.Files.*;
@@ -12,6 +14,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 
+public class Nanocode {
 /**
  * nanocode - minimal claude code alternative. Original:
  * https://github.com/1rgs/nanocode
@@ -20,11 +23,14 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 static final ObjectMapper JSON = new ObjectMapper();
 
 static final String OPENROUTER_KEY = getenv("OPENROUTER_API_KEY");
+static final String GEMINI_KEY = getenv("GEMINI_API_KEY");
 static final String API_URL = OPENROUTER_KEY != null
         ? "https://openrouter.ai/api/v1/messages"
         : "https://api.anthropic.com/v1/messages";
 static final String MODEL = Optional.ofNullable(getenv("MODEL"))
-        .orElse(OPENROUTER_KEY != null ? "anthropic/claude-opus-4.5" : "claude-opus-4-5");
+        .orElse(OPENROUTER_KEY != null ? "anthropic/claude-opus-4.5" : GEMINI_KEY != null ? "gemini-flash-latest" : "claude-opus-4-5");
+static final String PROVIDER = OPENROUTER_KEY != null ? "OpenRouter" : GEMINI_KEY != null ? "Gemini" : "Anthropic";
+static String geminiLastId;
 
 static final String RESET = "\033[0m", BOLD = "\033[1m", DIM = "\033[2m";
 static final String BLUE = "\033[34m", CYAN = "\033[36m", GREEN = "\033[32m", RED = "\033[31m";
@@ -85,7 +91,7 @@ static String toolGrep(JsonNode args) throws IOException {
     var base = Path.of(args.path("path").asText("."));
     var hits = new ArrayList<String>();
     try (var walk = walk(base)) {
-        walk.filter(Files::isRegularFile).takeWhile(_ -> hits.size() < 50).forEach(file -> {
+        walk.filter(Files::isRegularFile).takeWhile(path -> hits.size() < 50).forEach(file -> {
             try {
                 var lines = readAllLines(file);
                 for (int i = 0; i < lines.size() && hits.size() < 50; i++)
@@ -167,6 +173,88 @@ static JsonNode callApi(ArrayNode messages, String systemPrompt) throws IOExcept
     return response;
 }
 
+static ArrayNode geminiTools() throws IOException {
+    var tools = JSON.createArrayNode();
+    for (var tool : JSON.readTree(SCHEMA)) {
+        tools.add(JSON.createObjectNode().put("type", "function")
+                .put("name", tool.get("name").asText())
+                .put("description", tool.get("description").asText())
+                .<ObjectNode>set("parameters", tool.get("input_schema")));
+    }
+    return tools;
+}
+
+static JsonNode callGemini(JsonNode input, String systemPrompt, String previousInteractionId) throws IOException {
+    var body = JSON.createObjectNode().put("model", MODEL);
+    if (previousInteractionId == null)
+        body.put("system_instruction", systemPrompt);
+    else
+        body.put("previous_interaction_id", previousInteractionId);
+    if (input.isTextual())
+        body.put("input", input.asText());
+    else
+        body.set("input", input);
+    body.set("tools", geminiTools());
+
+    var conn = (HttpURLConnection) URI.create("https://generativelanguage.googleapis.com/v1beta/interactions").toURL().openConnection();
+    conn.setRequestMethod("POST");
+    conn.setDoOutput(true);
+    conn.setRequestProperty("Content-Type", "application/json");
+    conn.setRequestProperty("x-goog-api-key", GEMINI_KEY);
+
+    try (var os = conn.getOutputStream()) {
+        os.write(JSON.writeValueAsBytes(body));
+    }
+    int status = conn.getResponseCode();
+    var response = JSON.readTree(status >= 400 ? conn.getErrorStream() : conn.getInputStream());
+    if (status >= 400) {
+        var error = response.path("error");
+        var message = error.path("message").asText(response.toString());
+        var code = error.path("code").asText();
+        throw new IOException("API error " + status + (code.isEmpty() ? "" : " " + code) + ": " + message);
+    }
+    return response;
+}
+
+static void runGeminiTurn(String input, String systemPrompt) throws IOException {
+    var response = callGemini(JSON.getNodeFactory().textNode(input), systemPrompt, geminiLastId);
+
+    while (true) {
+        var responseId = response.get("id").asText();
+        geminiLastId = responseId;
+        var toolResults = JSON.createArrayNode();
+
+        for (var step : response.path("steps")) {
+            if ("model_output".equals(step.path("type").asText()))
+                for (var content : step.path("content"))
+                    if ("text".equals(content.path("type").asText()))
+                        System.out.println("\n" + CYAN + "⏺" + RESET + " "
+                                + content.get("text").asText().replaceAll("\\*\\*(.+?)\\*\\*", BOLD + "$1" + RESET));
+
+            if ("function_call".equals(step.path("type").asText())) {
+                var name = step.get("name").asText();
+                var toolArgs = step.get("arguments");
+                var argPreview = toolArgs.fields().hasNext() ? toolArgs.fields().next().getValue().asText()
+                        : "";
+                System.out
+                        .println("\n" + GREEN + "⏺ " + Character.toUpperCase(name.charAt(0)) + name.substring(1)
+                                + RESET + "(" + DIM + argPreview.substring(0, Math.min(50, argPreview.length()))
+                                + RESET + ")");
+
+                var result = runTool(name, toolArgs);
+                System.out.println("  " + DIM + "⎿  " + preview(result, 60) + RESET);
+
+                toolResults.add(JSON.createObjectNode().put("type", "function_result")
+                        .put("call_id", step.get("id").asText()).put("name", name).put("result", result));
+            }
+        }
+
+        if (!"requires_action".equals(response.path("status").asText()))
+            break;
+        response = callGemini(toolResults, systemPrompt, responseId);
+    }
+}
+
 // --- UI ---
 
 static String sep() {
@@ -187,10 +275,10 @@ static String preview(String s, int max) {
 
 // --- Main ---
 
-void main(String[] args) throws Exception {
+public static void main(String[] args) throws Exception {
     var cwd = System.getProperty("user.dir");
     System.out.println(BOLD + "nanocode" + RESET + " | " + DIM + MODEL + " ("
-            + (OPENROUTER_KEY != null ? "OpenRouter" : "Anthropic") + ") | " + cwd + RESET + "\n");
+            + PROVIDER + ") | " + cwd + RESET + "\n");
 
     var messages = JSON.createArrayNode();
     var systemPrompt = "Concise coding assistant. cwd: " + cwd;
@@ -212,44 +300,49 @@ void main(String[] args) throws Exception {
                 break;
             if (input.equals("/c")) {
                 messages = JSON.createArrayNode();
+                geminiLastId = null;
                 System.out.println(GREEN + "⏺ Cleared" + RESET);
                 continue;
             }
 
-            messages.add(JSON.createObjectNode().put("role", "user").put("content", input));
+            if (GEMINI_KEY != null && OPENROUTER_KEY == null) {
+                runGeminiTurn(input, systemPrompt);
+            } else {
+                messages.add(JSON.createObjectNode().put("role", "user").put("content", input));
 
-            while (true) {
-                var response = callApi(messages, systemPrompt);
-                var content = response.get("content");
-                var toolResults = JSON.createArrayNode();
+                while (true) {
+                    var response = callApi(messages, systemPrompt);
+                    var content = response.get("content");
+                    var toolResults = JSON.createArrayNode();
 
-                for (var block : content) {
-                    if ("text".equals(block.get("type").asText()))
-                        System.out.println("\n" + CYAN + "⏺" + RESET + " "
-                                + block.get("text").asText().replaceAll("\\*\\*(.+?)\\*\\*", BOLD + "$1" + RESET));
+                    for (var block : content) {
+                        if ("text".equals(block.get("type").asText()))
+                            System.out.println("\n" + CYAN + "⏺" + RESET + " "
+                                    + block.get("text").asText().replaceAll("\\*\\*(.+?)\\*\\*", BOLD + "$1" + RESET));
 
-                    if ("tool_use".equals(block.get("type").asText())) {
-                        var name = block.get("name").asText();
-                        var toolArgs = block.get("input");
-                        var argPreview = toolArgs.fields().hasNext() ? toolArgs.fields().next().getValue().asText()
-                                : "";
-                        System.out
-                                .println("\n" + GREEN + "⏺ " + Character.toUpperCase(name.charAt(0)) + name.substring(1)
-                                        + RESET + "(" + DIM + argPreview.substring(0, Math.min(50, argPreview.length()))
-                                        + RESET + ")");
+                        if ("tool_use".equals(block.get("type").asText())) {
+                            var name = block.get("name").asText();
+                            var toolArgs = block.get("input");
+                            var argPreview = toolArgs.fields().hasNext() ? toolArgs.fields().next().getValue().asText()
+                                    : "";
+                            System.out
+                                    .println("\n" + GREEN + "⏺ " + Character.toUpperCase(name.charAt(0)) + name.substring(1)
+                                            + RESET + "(" + DIM + argPreview.substring(0, Math.min(50, argPreview.length()))
+                                            + RESET + ")");
 
-                        var result = runTool(name, toolArgs);
-                        System.out.println("  " + DIM + "⎿  " + preview(result, 60) + RESET);
+                            var result = runTool(name, toolArgs);
+                            System.out.println("  " + DIM + "⎿  " + preview(result, 60) + RESET);
 
-                        toolResults.add(JSON.createObjectNode().put("type", "tool_result")
-                                .put("tool_use_id", block.get("id").asText()).put("content", result));
+                            toolResults.add(JSON.createObjectNode().put("type", "tool_result")
+                                    .put("tool_use_id", block.get("id").asText()).put("content", result));
+                        }
                     }
-                }
 
-                messages.add(JSON.createObjectNode().put("role", "assistant").<ObjectNode>set("content", content));
-                if (toolResults.isEmpty())
-                    break;
-                messages.add(JSON.createObjectNode().put("role", "user").<ObjectNode>set("content", toolResults));
+                    messages.add(JSON.createObjectNode().put("role", "assistant").<ObjectNode>set("content", content));
+                    if (toolResults.isEmpty())
+                        break;
+                    messages.add(JSON.createObjectNode().put("role", "user").<ObjectNode>set("content", toolResults));
+                }
             }
             System.out.println();
         } catch (Exception e) {
@@ -258,4 +351,5 @@ void main(String[] args) throws Exception {
             System.out.println(RED + "⏺ Error: " + e.getMessage() + RESET);
         }
     }
+}
 }
