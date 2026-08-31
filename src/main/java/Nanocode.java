@@ -28,6 +28,11 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 
+import org.jline.reader.EndOfFileException;
+import org.jline.reader.LineReaderBuilder;
+import org.jline.reader.UserInterruptException;
+import org.jline.terminal.TerminalBuilder;
+
 public class Nanocode {
 /**
  * nanocode - minimal claude code alternative. Original:
@@ -681,16 +686,20 @@ public static void main(String[] args) throws Exception {
     var messages = JSON.createArrayNode();
     var systemPrompt = "Concise coding assistant. cwd: " + cwd + ". os: " + System.getProperty("os.name")
             + (OS_NAME.contains("win") ? " (bash tool runs cmd.exe)" : "");
-    var stdin = new BufferedReader(new InputStreamReader(System.in));
+    var terminal = TerminalBuilder.builder().build();
+    var reader = LineReaderBuilder.builder().terminal(terminal).build();
 
     while (true) {
         try {
             System.out.println(sep());
-            System.out.print(BOLD + BLUE + "❯" + RESET + " ");
-            System.out.flush();
-            var input = stdin.readLine();
-            if (input == null)
+            String input;
+            try {
+                input = reader.readLine(BOLD + BLUE + "❯" + RESET + " ");
+            } catch (UserInterruptException e) {
+                continue;
+            } catch (EndOfFileException e) {
                 break;
+            }
             input = input.strip();
             System.out.println(sep());
             if (input.isEmpty())
