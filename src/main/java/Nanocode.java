@@ -640,7 +640,7 @@ static boolean selectProvider(String[] args) {
         case "openrouter" -> "anthropic/claude-opus-4.5";
         case "gemini" -> "gemini-flash-latest";
         case "anthropic" -> "claude-opus-4-5";
-        default -> "gemini-3.7-flash-medium"; // antigravity wire IDs carry an effort suffix
+        default -> "gemini-3.7-flash-high"; // antigravity wire IDs carry an effort suffix
     });
     API_URL = switch (PROVIDER) {
         case "openrouter" -> "https://openrouter.ai/api/v1/messages";
