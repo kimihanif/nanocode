@@ -2,6 +2,8 @@ import java.io.*;
 import java.net.BindException;
 import java.net.HttpURLConnection;
 import java.net.InetSocketAddress;
+import java.net.SocketException;
+import java.net.SocketTimeoutException;
 import java.net.URI;
 import java.net.URLDecoder;
 import java.net.URLEncoder;
@@ -13,6 +15,8 @@ import java.util.*;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.*;
+
+import javax.net.ssl.SSLException;
 
 import com.sun.net.httpserver.HttpServer;
 
@@ -370,25 +374,31 @@ static String oauthLogin() throws Exception {
 }
 
 static JsonNode callCodeAssist(String method, JsonNode body) throws Exception {
-    var conn = (HttpURLConnection) URI.create(AGY_URL + ":" + method).toURL().openConnection();
-    conn.setRequestMethod("POST");
-    conn.setDoOutput(true);
-    conn.setRequestProperty("Content-Type", "application/json");
-    conn.setRequestProperty("Authorization", "Bearer " + accessToken());
-    conn.setRequestProperty("User-Agent", AGY_UA);
-    if ("onboardUser".equals(method))
-        conn.setRequestProperty("X-Goog-Api-Client", "gl-node/22.21.1");
+    return withAntigravityRetries(last -> {
+        var conn = (HttpURLConnection) URI.create(AGY_URL + ":" + method).toURL().openConnection();
+        conn.setRequestMethod("POST");
+        conn.setConnectTimeout(10_000);
+        conn.setReadTimeout(300_000);
+        conn.setDoOutput(true);
+        conn.setRequestProperty("Content-Type", "application/json");
+        conn.setRequestProperty("Authorization", "Bearer " + accessToken());
+        conn.setRequestProperty("User-Agent", AGY_UA);
+        if ("onboardUser".equals(method))
+            conn.setRequestProperty("X-Goog-Api-Client", "gl-node/22.21.1");
 
-    try (var os = conn.getOutputStream()) {
-        os.write(JSON.writeValueAsBytes(body));
-    }
-    int status = conn.getResponseCode();
-    var response = JSON.readTree(status >= 400 ? conn.getErrorStream() : conn.getInputStream());
-    if (status >= 400) {
-        var message = response.path("error").path("message").asText(response.toString());
-        throw new IOException("API error " + status + ": " + message);
-    }
-    return response;
+        try (var os = conn.getOutputStream()) {
+            os.write(JSON.writeValueAsBytes(body));
+        }
+        int status = conn.getResponseCode();
+        var response = JSON.readTree(status >= 400 ? conn.getErrorStream() : conn.getInputStream());
+        if (status >= 400) {
+            var message = response.path("error").path("message").asText(response.toString());
+            if (!last && (status == 429 || status >= 500))
+                throw new RetryableStatus();
+            throw new IOException("API error " + status + ": " + message);
+        }
+        return response;
+    });
 }
 
 static String codeAssistProject() throws Exception {
@@ -507,21 +517,48 @@ static String enc(String s) {
     return URLEncoder.encode(s, StandardCharsets.UTF_8);
 }
 
-static JsonNode tokenRequest(String params) throws IOException {
-    var conn = (HttpURLConnection) URI.create("https://oauth2.googleapis.com/token").toURL().openConnection();
-    conn.setRequestMethod("POST");
-    conn.setDoOutput(true);
-    conn.setRequestProperty("Content-Type", "application/x-www-form-urlencoded");
-    try (var os = conn.getOutputStream()) {
-        os.write(params.getBytes(StandardCharsets.UTF_8));
+static JsonNode tokenRequest(String params) throws Exception {
+    return withAntigravityRetries(last -> {
+        var conn = (HttpURLConnection) URI.create("https://oauth2.googleapis.com/token").toURL().openConnection();
+        conn.setRequestMethod("POST");
+        conn.setConnectTimeout(10_000);
+        conn.setReadTimeout(30_000);
+        conn.setDoOutput(true);
+        conn.setRequestProperty("Content-Type", "application/x-www-form-urlencoded");
+        try (var os = conn.getOutputStream()) {
+            os.write(params.getBytes(StandardCharsets.UTF_8));
+        }
+        int status = conn.getResponseCode();
+        var response = JSON.readTree(status >= 400 ? conn.getErrorStream() : conn.getInputStream());
+        if (status >= 400) {
+            var message = response.path("error_description").asText(response.path("error").path("message").asText(response.toString()));
+            if (!last && (status == 429 || status >= 500))
+                throw new RetryableStatus();
+            throw new IOException("OAuth error " + status + ": " + message);
+        }
+        return response;
+    });
+}
+
+interface AntigravityAttempt<T> {
+    T run(boolean last) throws Exception;
+}
+
+static final class RetryableStatus extends Exception {
+}
+
+static <T> T withAntigravityRetries(AntigravityAttempt<T> attempt) throws Exception {
+    for (int retry = 0; ; retry++) {
+        try {
+            return attempt.run(retry == 3);
+        } catch (RetryableStatus e) {
+        } catch (SSLException | SocketException | SocketTimeoutException | EOFException e) {
+            if (retry == 3)
+                throw e;
+        }
+        System.out.println(DIM + "⏺ retrying (" + (retry + 1) + "/3)..." + RESET);
+        Thread.sleep(1000L << retry);
     }
-    int status = conn.getResponseCode();
-    var response = JSON.readTree(status >= 400 ? conn.getErrorStream() : conn.getInputStream());
-    if (status >= 400) {
-        var message = response.path("error_description").asText(response.path("error").path("message").asText(response.toString()));
-        throw new IOException("OAuth error " + status + ": " + message);
-    }
-    return response;
 }
 
 static void saveCreds() throws IOException {
@@ -593,6 +630,10 @@ static boolean selectProvider(String[] args) {
         System.out.println(RED + "⏺ Error: unknown provider '" + PROVIDER
                 + "' (valid: antigravity, openrouter, gemini, anthropic)" + RESET);
         return false;
+    }
+    if ("antigravity".equals(PROVIDER)) {
+        // Avoid stale pooled sockets that can fail during TLS handshakes.
+        System.setProperty("http.keepAlive", "false");
     }
 
     MODEL = Optional.ofNullable(getenv("MODEL")).orElse(switch (PROVIDER) {
