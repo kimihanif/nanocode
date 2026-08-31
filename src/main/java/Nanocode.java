@@ -29,8 +29,8 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 
 import org.jline.reader.EndOfFileException;
-import org.jline.reader.LineReaderBuilder;
 import org.jline.reader.UserInterruptException;
+import org.jline.reader.impl.LineReaderImpl;
 import org.jline.terminal.TerminalBuilder;
 
 public class Nanocode {
@@ -40,6 +40,8 @@ public class Nanocode {
  */
 
 static final ObjectMapper JSON = new ObjectMapper();
+static final Map<String, String> PASTES = new LinkedHashMap<>();
+static int pasteCounter = 0;
 
 static final String OPENROUTER_KEY = getenv("OPENROUTER_API_KEY");
 static final String GEMINI_KEY = getenv("GEMINI_API_KEY");
@@ -687,7 +689,33 @@ public static void main(String[] args) throws Exception {
     var systemPrompt = "Concise coding assistant. cwd: " + cwd + ". os: " + System.getProperty("os.name")
             + (OS_NAME.contains("win") ? " (bash tool runs cmd.exe)" : "");
     var terminal = TerminalBuilder.builder().build();
-    var reader = LineReaderBuilder.builder().terminal(terminal).build();
+    var reader = new LineReaderImpl(terminal, "nanocode", null) {
+        boolean accumulating = false;
+
+        @Override
+        public boolean beginPaste() {
+            getBuffer().write(pasteToBuffer(doReadStringUntil(BRACKETED_PASTE_END)));
+            return true;
+        }
+
+        @Override
+        public boolean acceptLine() {
+            // input already pending right behind this Enter → it is a pasted newline, not a submit
+            if (bindingReader.peekCharacter(35L) >= 0) {
+                accumulating = true;
+                getBuffer().write("\n");
+                return true;
+            }
+            if (accumulating) {
+                accumulating = false;
+                var content = getBuffer().toString();
+                getBuffer().clear();
+                getBuffer().write(pasteToBuffer(content));
+                return true;
+            }
+            return super.acceptLine();
+        }
+    };
 
     while (true) {
         try {
@@ -696,10 +724,16 @@ public static void main(String[] args) throws Exception {
             try {
                 input = reader.readLine(BOLD + BLUE + "❯" + RESET + " ");
             } catch (UserInterruptException e) {
+                PASTES.clear();
+                pasteCounter = 0;
                 continue;
             } catch (EndOfFileException e) {
                 break;
             }
+            for (var e : PASTES.entrySet())
+                input = input.replace(e.getKey(), e.getValue());
+            PASTES.clear();
+            pasteCounter = 0;
             input = input.strip();
             System.out.println(sep());
             if (input.isEmpty())
@@ -762,5 +796,18 @@ public static void main(String[] args) throws Exception {
             System.out.println(RED + "⏺ Error: " + e.getMessage() + RESET);
         }
     }
+}
+
+static String pasteToBuffer(String str) {
+    str = str.replace("\r\n", "\n").replace('\r', '\n');
+    if (str.endsWith("\n"))
+        str = str.substring(0, str.length() - 1);
+    int lines = str.split("\n", -1).length;
+    if (lines > 10 || str.length() > 1000) {
+        var marker = "[paste #" + (++pasteCounter) + " +" + lines + " lines]";
+        PASTES.put(marker, str);
+        return marker;
+    }
+    return str;
 }
 }
